@@ -81,6 +81,7 @@ EMOJI = {
     "quality":   ("5776233299424843260", "🌐"),
     "folder":    ("5296348778012361146", "🏷"),
     "bolt":      ("5305336095863485125", "🍉"),
+    "refresh":   ("5877410604225924969", "🔄"),
 }
 
 
@@ -90,6 +91,11 @@ def em(slot: str) -> str:
     if USE_PREMIUM_EMOJI and cid:
         return f'<tg-emoji emoji-id="{cid}">{fallback}</tg-emoji>'
     return fallback
+
+
+def emj(slot: str) -> str:
+    """Только обычный юникод-символ (для текста кнопок — там HTML/премиум не парсится)."""
+    return EMOJI.get(slot, ("", "•"))[1]
 
 
 # ───────────────────────────── СБОР ДАННЫХ ─────────────────────────────
@@ -145,6 +151,26 @@ def _fmt_size(num):
         return f"{int(num) / (1024 * 1024):.1f} MB" if num else None
     except (TypeError, ValueError):
         return None
+
+
+def _download_bytes(urls, referer="https://www.tiktok.com/"):
+    """Пробует по очереди список URL, возвращает (bytes, content_type) первого,
+    который отдал реальный медиа-контент (video/audio/image). None если все упали."""
+    if isinstance(urls, str):
+        urls = [urls]
+    for u in urls:
+        if not u:
+            continue
+        try:
+            r = SESSION.get(u, headers={"Referer": referer}, timeout=40, stream=True)
+            ct = r.headers.get("Content-Type", "")
+            if r.status_code == 200 and ("video" in ct or "audio" in ct
+                                         or "image" in ct or "octet-stream" in ct):
+                return r.content, ct
+            r.close()
+        except Exception as e:
+            logging.warning(f"download_bytes {u[:40]}: {e}")
+    return None, None
 
 
 # Флаг-эмодзи из кода страны (US -> 🇺🇸)
@@ -227,6 +253,62 @@ RU_MONTHS = {
     7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
 }
 
+# С заглавной — для гибрид-режима ("11 Июня 2026")
+RU_MONTHS_CAP = {
+    1: "Января", 2: "Февраля", 3: "Марта", 4: "Апреля", 5: "Мая", 6: "Июня",
+    7: "Июля", 8: "Августа", 9: "Сентября", 10: "Октября", 11: "Ноября", 12: "Декабря",
+}
+
+
+def humanize(n):
+    """12000 -> 12.0K, 1500000 -> 1.5M (как в гибрид-режиме)."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+# ─────────────────────────── РЕЖИМЫ / НАСТРОЙКИ ───────────────────────────
+# Режим вывода на пользователя: "checker" (подробный текст) или "hybrid"
+# (превью + компактная подпись + кнопки скачивания). Хранится в файле, чтобы
+# переживать перезапуск. Меняется через /settings.
+import os
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+DEFAULT_MODE = "hybrid"
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_settings(data):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning(f"save_settings: {e}")
+
+
+USER_MODE = _load_settings()
+
+
+def get_mode(user_id) -> str:
+    return USER_MODE.get(str(user_id), DEFAULT_MODE)
+
+
+def set_mode(user_id, mode):
+    USER_MODE[str(user_id)] = mode
+    _save_settings(USER_MODE)
+
 
 def extract_tiktok_full_analytics(url: str):
     final_url = _resolve_url(url)
@@ -308,10 +390,13 @@ def extract_tiktok_full_analytics(url: str):
         fmt = {
             'gear': b.get("GearName"), 'label': gear_label,
             'resolution': f"{w}x{h}" if w and h else "N/A",
+            'res_class': res_class,
             'height_num': h or 0, 'fps': fps,
             'bitrate': f"{br / 1_000_000:.1f} Mbps" if br else None,
             'codec': codec, 'size': _fmt_size(pa.get("DataSize")),
+            'size_bytes': pa.get("DataSize"),
             'aweme_url': aweme_url,
+            'urls': list(pa.get("UrlList", [])),  # все ссылки этого гира (для скачивания)
         }
         formats_data.append(fmt)
         if best is None or fmt['height_num'] > best['height_num']:
@@ -323,11 +408,23 @@ def extract_tiktok_full_analytics(url: str):
     music_url = (cdn or {}).get("music_url") or music.get("playUrl")
     labels = item.get("diversificationLabels") or []
 
+    # Обложка (превью) — самая качественная
+    cover = (video.get("cover") or video.get("originCover")
+             or video.get("dynamicCover") or "")
+
+    # Короткая дата для гибрид-режима ("11 Июня 2026")
+    try:
+        dt2 = datetime.fromtimestamp(int(ts))
+        date_short = f"{dt2.day} {RU_MONTHS_CAP[dt2.month]} {dt2.year}" if ts else "Неизвестно"
+    except (TypeError, ValueError, KeyError):
+        date_short = "Неизвестно"
+
     return {
         'uploader': uploader, 'uploader_url': uploader_url, 'unique_id': unique_id,
-        'date_str': date_str, 'final_url': final_url, 'video_url': video_url, 'description': description,
+        'date_str': date_str, 'date_short': date_short,
+        'final_url': final_url, 'video_url': video_url, 'description': description,
         'music_title': music_title, 'music_dur': music_dur, 'music_url': music_url,
-        'duration': video.get('duration'),
+        'duration': video.get('duration'), 'cover': cover,
         'stats': stats, 'video_id': video_id,
         'region_code': region_code, 'region_name': region_name, 'region_flag': _flag(region_code),
         'shadow_str': shadow_str, 'orig_res': orig_res, 'vq_score': vq_score,
@@ -337,13 +434,234 @@ def extract_tiktok_full_analytics(url: str):
 
 
 # ───────────────────────────── ВЫВОД ─────────────────────────────
-# Кэш оригинального JSON по video_id — чтобы отдать его по нажатию кнопки.
+# Кэши по video_id: оригинальный JSON и полностью распарсенные данные (для кнопок).
 JSON_CACHE = {}
+DATA_CACHE = {}
+
+
+def _uniq_download_formats(d):
+    """Уникальные качества для кнопок скачивания — по одному на класс разрешения
+    (берём вариант с наибольшим размером/битрейтом). Возвращает список fmt."""
+    by_res = {}
+    for f in d.get('formats', []) or []:
+        key = f.get('res_class') or f.get('resolution')
+        cur = by_res.get(key)
+        if cur is None or (f.get('size_bytes') or 0) > (cur.get('size_bytes') or 0):
+            by_res[key] = f
+    return sorted(by_res.values(), key=lambda x: x['height_num'])
+
+
+def _fmt_dl_urls(d, fmt):
+    """Список URL для скачивания конкретного качества (по приоритету открываемости)."""
+    cdn = d.get('cdn') or {}
+    urls = []
+    # aweme/v1/play обычно отдаётся напрямую
+    if fmt.get('aweme_url'):
+        urls.append(fmt['aweme_url'])
+    # tikwm hd/sd — публичный CDN без 403
+    if fmt.get('codec') == 'hevc' and cdn.get('hd_url'):
+        urls.append(cdn['hd_url'])
+    if cdn.get('sd_url'):
+        urls.append(cdn['sd_url'])
+    # прямые ссылки гира (webapp-prime) — как последний вариант
+    urls += fmt.get('urls', [])
+    return urls
+
+
+def build_checker_text(d):
+    """Собирает подробный текст режима «Чекер» + клавиатуру."""
+    desc = html.escape(d['description'])
+    nick = html.escape(d['uploader'])
+    best = d['best']
+    cdn = d.get('cdn') or {}
+    vurl = d['video_url']
+    vid = str(d['video_id'])
+
+    def mbps(size_bytes):
+        try:
+            dur = d.get('duration')
+            return f"{int(size_bytes) * 8 / dur / 1_000_000:.1f} Mbps" if size_bytes and dur else None
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    top_label = best['label'] if best else "—"
+
+    lines = []
+    lines.append(f"{em('video')} <b><a href='{vurl}'>ВИДЕО</a> • АНАЛИТИКА</b>\n")
+    lines.append(f"{em('user')} <b><a href='{d['uploader_url']}'>{nick}</a></b> • "
+                 f"{em('calendar')} <b><code>{d['date_str']}</code></b>")
+    lines.append(f"<blockquote><b>{desc}</b></blockquote>")
+    music_link = d.get('music_url')
+    zvuk = f"<a href='{music_link}'>Звук</a>" if music_link else "Звук"
+    lines.append(f"{em('music')} <b>{zvuk} • {d['music_dur']}</b>\n")
+
+    s = d['stats']
+    lines.append(f"{em('stats')} <b>Статистика</b>")
+    lines.append(f"• {em('eye')} <b><code>{s['views']:,}</code> Просмотры</b>")
+    lines.append(f"• {em('heart')} <b><code>{s['likes']:,}</code> Лайки</b>")
+    lines.append(f"• {em('comment')} <b><code>{s['comments']:,}</code> Комментарии</b>")
+    lines.append(f"• {em('bookmark')} <b><code>{s['favorites']:,}</code> Избранные</b>")
+    lines.append(f"• {em('repost')} <b><code>{s['shares']:,}</code> Репосты</b>")
+    lines.append(f"• {em('download')} <b><code>{s['downloads']:,}</code> Скачивания</b>\n")
+
+    lines.append(f"{em('info')} <b>Информация</b>")
+    lines.append(f"• {em('id')} <b>Айди | <code>{d['video_id']}</code></b>")
+    lines.append(f"• {em('source')} <b>Источник | <a href='{vurl}'><code>Браузер</code></a></b>")
+    lines.append(f"• {em('region')} <b>Регион | <code>{d['region_flag']} {html.escape(d['region_name'])}</code></b>")
+    lines.append(f"• {em('ghost')} <b>Теневой бан | <code>{d['shadow_str']}</code></b>\n")
+
+    lines.append(f"{em('star')} <b>Качество</b>")
+    lines.append(f"• {em('globe')} <b>Браузер | <code>{top_label}</code></b>")
+    lines.append(f"• {em('phone')} <b>Телефон | <code>{top_label}</code></b>")
+
+    # ВСЕ качества, которые видит TikTok (каждый гир отдельной строкой)
+    quality_block = []
+    for f in d.get('formats', []):
+        link = f.get('aweme_url') or (f.get('urls') or [None])[0]
+        gear = f.get('gear') or 'video'
+        if link:
+            head = f"{em('globe')}{em('phone')} <a href='{link}'>{gear}</a>"
+        else:
+            head = f"{em('globe')}{em('phone')} {gear}"
+        quality_block.append(head)
+        quality_block.append(
+            f"{f['label']} • {f.get('bitrate') or '—'} • {f['codec']} • {f.get('size') or '—'}")
+    # плюс прямые CDN-ссылки tikwm (без 403), если есть
+    if cdn.get('hd_url'):
+        quality_block.append(f"{em('download')} <a href='{cdn['hd_url']}'>CDN HD (hevc)</a> • "
+                             f"{_fmt_size(cdn.get('hd_size')) or '—'}")
+    if cdn.get('sd_url'):
+        quality_block.append(f"{em('download')} <a href='{cdn['sd_url']}'>CDN SD (h264)</a> • "
+                             f"{_fmt_size(cdn.get('sd_size')) or '—'}")
+    if quality_block:
+        lines.append("<blockquote expandable><b>" + "\n".join(quality_block) + "</b></blockquote>")
+
+    lines.append(f"<b>| Оригинал | <code>{d['orig_res']}</code></b>")
+    lines.append(f"<b>| VQ Score | <code>{d['vq_score']}</code></b>\n")
+
+    if d['labels']:
+        lines.append(f"{em('folder')} <b>Категории</b>")
+        chunk = d['labels']
+        for i in range(0, len(chunk), 2):
+            part = ", ".join(html.escape(x) for x in chunk[i:i + 2])
+            lines.append(f"<b>| <code>{part}</code></b>")
+        lines.append("")
+
+    lines.append(f"{em('bolt')} <b>orbuz:TikTok Checker &amp; Downloader</b>")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{emj('refresh')} Перепроверить", callback_data=f"recheck:{vid}")],
+        [InlineKeyboardButton(text="📄 JSON (оригинал)", callback_data=f"json:{vid}")],
+    ])
+    return "\n".join(lines), keyboard
+
+
+def build_hybrid_text(d):
+    """Компактная подпись режима «Гибрид» + клавиатура (превью-фото шлётся отдельно)."""
+    desc = html.escape(d['description'])
+    nick = html.escape(d['uploader'])
+    vurl = d['video_url']
+    vid = str(d['video_id'])
+    s = d['stats']
+
+    lines = []
+    lines.append(f"{em('video')} <b>ВИДЕО • {d['music_dur']}</b>\n")
+    lines.append(
+        f"{em('user')}<a href='{d['uploader_url']}'>{nick}</a>  "
+        f"{em('calendar')}<a href='{vurl}'>{d['date_short']}</a>  "
+        f"{em('region')}{d['region_flag']} {html.escape(d['region_name'])}")
+    lines.append(f"<blockquote>{desc}</blockquote>")
+    lines.append(
+        f"{em('eye')}{humanize(s['views'])} {em('heart')}{humanize(s['likes'])} "
+        f"{em('comment')}{humanize(s['comments'])} {em('bookmark')}{humanize(s['favorites'])} "
+        f"{em('repost')}{humanize(s['shares'])}\n")
+    lines.append("↓ Выберите действие")
+
+    # Кнопки: качества для скачивания (по 2 в ряд), Оригинал+MP3, Чекнуть, автор
+    rows = []
+    dls = _uniq_download_formats(d)
+    row = []
+    for i, f in enumerate(dls):
+        idx = d['formats'].index(f)
+        label = f"{emj('download')} {f['res_class']} • {f.get('size') or '—'}"
+        row.append(InlineKeyboardButton(text=label, callback_data=f"dl:{vid}:{idx}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text="⚡ Оригинал", callback_data=f"orig:{vid}"),
+        InlineKeyboardButton(text="🎵 MP3", callback_data=f"mp3:{vid}"),
+    ])
+    rows.append([InlineKeyboardButton(text=f"{emj('stats')} Чекнуть", callback_data=f"check:{vid}")])
+    rows.append([InlineKeyboardButton(text=f"{emj('user')} {nick}", url=d['uploader_url'])])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+    return "\n".join(lines), keyboard
+
+
+async def _send_result(message, d):
+    """Отправляет результат в зависимости от режима пользователя."""
+    vid = str(d['video_id'])
+    JSON_CACHE[vid] = d.get('raw') or {}
+    DATA_CACHE[vid] = d
+
+    mode = get_mode(message.chat.id)
+    if mode == "hybrid":
+        text, keyboard = build_hybrid_text(d)
+        cover = d.get('cover')
+        photo_bytes = None
+        if cover:
+            photo_bytes, _ = await asyncio.to_thread(_download_bytes, cover)
+        if photo_bytes:
+            await message.answer_photo(
+                BufferedInputFile(photo_bytes, filename=f"{vid}.jpg"),
+                caption=text, parse_mode="HTML", reply_markup=keyboard)
+        else:
+            # обложку не достали — шлём без фото
+            await message.answer(text, parse_mode="HTML", reply_markup=keyboard,
+                                 link_preview_options=LinkPreviewOptions(is_disabled=True))
+    else:
+        text, keyboard = build_checker_text(d)
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard,
+                             link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
-    await message.answer("Отправь мне любую ссылку на TikTok, и я соберу аналитику")
+    await message.answer("Отправь мне любую ссылку на TikTok, и я соберу аналитику.\n"
+                         "Режим вывода меняется командой /settings")
+
+
+@dp.message(F.text == "/settings")
+async def settings_cmd(message: types.Message):
+    mode = get_mode(message.chat.id)
+    mark = lambda m: "✅ " if mode == m else ""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{mark('hybrid')}Гибрид", callback_data="mode:hybrid")],
+        [InlineKeyboardButton(text=f"{mark('checker')}Чекер", callback_data="mode:checker")],
+    ])
+    await message.answer(
+        "<b>⚙️ Настройки — режим вывода</b>\n\n"
+        "• <b>Гибрид</b> — превью видео, компактная инфо и кнопки скачивания\n"
+        "• <b>Чекер</b> — подробная аналитика со всеми качествами",
+        parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("mode:"))
+async def switch_mode(callback: types.CallbackQuery):
+    mode = callback.data.split(":", 1)[1]
+    set_mode(callback.message.chat.id, mode)
+    name = "Гибрид" if mode == "hybrid" else "Чекер"
+    await callback.answer(f"Режим: {name}")
+    mark = lambda m: "✅ " if mode == m else ""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{mark('hybrid')}Гибрид", callback_data="mode:hybrid")],
+        [InlineKeyboardButton(text=f"{mark('checker')}Чекер", callback_data="mode:checker")],
+    ])
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
 
 
 @dp.message(F.text.contains("tiktok.com"))
@@ -359,108 +677,113 @@ async def handle_tiktok(message: types.Message):
         await message.answer("Не удалось обработать ссылку. Проверьте, что видео открыто для всех.")
         return
 
-    desc = html.escape(d['description'])
-    nick = html.escape(d['uploader'])          # никнейм (напр. "тгк @kitorbuz")
-    best = d['best']
+    await _send_result(message, d)
+
+
+@dp.callback_query(F.data.startswith("recheck:"))
+async def recheck(callback: types.CallbackQuery):
+    vid = callback.data.split(":", 1)[1]
+    d = DATA_CACHE.get(vid)
+    url = (d or {}).get('video_url')
+    if not url:
+        await callback.answer("Данные устарели, отправьте ссылку заново.", show_alert=True)
+        return
+    await callback.answer("Перепроверяю…")
+    d2 = await asyncio.to_thread(extract_tiktok_full_analytics, url)
+    if not d2:
+        await callback.answer("Не удалось перепроверить.", show_alert=True)
+        return
+    DATA_CACHE[vid] = d2
+    JSON_CACHE[vid] = d2.get('raw') or {}
+    text, keyboard = build_checker_text(d2)
+    try:
+        await callback.message.edit_text(
+            text, parse_mode="HTML", reply_markup=keyboard,
+            link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except Exception:
+        # если сообщение с фото (гибрид) — редактировать текст нельзя, шлём новое
+        await callback.message.answer(
+            text, parse_mode="HTML", reply_markup=keyboard,
+            link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+@dp.callback_query(F.data.startswith("check:"))
+async def check_action(callback: types.CallbackQuery):
+    vid = callback.data.split(":", 1)[1]
+    d = DATA_CACHE.get(vid)
+    if not d:
+        await callback.answer("Данные устарели, отправьте ссылку заново.", show_alert=True)
+        return
+    await callback.answer()
+    text, keyboard = build_checker_text(d)
+    await callback.message.answer(
+        text, parse_mode="HTML", reply_markup=keyboard,
+        link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def download_quality(callback: types.CallbackQuery):
+    _, vid, idx = callback.data.split(":")
+    d = DATA_CACHE.get(vid)
+    if not d:
+        await callback.answer("Данные устарели, отправьте ссылку заново.", show_alert=True)
+        return
+    try:
+        fmt = d['formats'][int(idx)]
+    except (IndexError, ValueError):
+        await callback.answer("Качество недоступно.", show_alert=True)
+        return
+    await callback.answer("Скачиваю…")
+    data, _ = await asyncio.to_thread(_download_bytes, _fmt_dl_urls(d, fmt))
+    if not data:
+        await callback.answer("Не удалось скачать это качество.", show_alert=True)
+        return
+    fname = f"{d['unique_id']}_{fmt.get('res_class') or 'video'}.mp4"
+    await callback.message.answer_video(
+        BufferedInputFile(data, filename=fname),
+        caption=f"{fmt['label']} • {fmt['codec']} • {fmt.get('size') or ''}")
+
+
+@dp.callback_query(F.data.startswith("orig:"))
+async def download_original(callback: types.CallbackQuery):
+    vid = callback.data.split(":", 1)[1]
+    d = DATA_CACHE.get(vid)
+    if not d:
+        await callback.answer("Данные устарели, отправьте ссылку заново.", show_alert=True)
+        return
+    await callback.answer("Скачиваю оригинал…")
     cdn = d.get('cdn') or {}
-    vurl = d['video_url']
+    best = d.get('best') or {}
+    urls = [cdn.get('hd_url'), cdn.get('sd_url')] + (best.get('urls') or [])
+    if best.get('aweme_url'):
+        urls.insert(0, best['aweme_url'])
+    data, _ = await asyncio.to_thread(_download_bytes, urls)
+    if not data:
+        await callback.answer("Не удалось скачать оригинал.", show_alert=True)
+        return
+    await callback.message.answer_document(
+        BufferedInputFile(data, filename=f"{d['unique_id']}_original.mp4"),
+        caption=f"Оригинал • {d.get('orig_res') or ''}")
 
-    def mbps(size_bytes):
-        try:
-            dur = d.get('duration')
-            return f"{int(size_bytes) * 8 / dur / 1_000_000:.1f} Mbps" if size_bytes and dur else None
-        except (TypeError, ValueError, ZeroDivisionError):
-            return None
 
-    top_label = best['label'] if best else "—"
-
-    lines = []
-    # Заголовок — слово ВИДЕО ведёт на само видео
-    lines.append(f"{em('video')} <b><a href='{vurl}'>ВИДЕО</a> • АНАЛИТИКА</b>\n")
-    # Автор (ник — ссылка на автора) / дата (в <code>, на русском)
-    lines.append(f"{em('user')} <b><a href='{d['uploader_url']}'>{nick}</a></b> • "
-                 f"{em('calendar')} <b><code>{d['date_str']}</code></b>")
-    # Описание — жирным, в цитате
-    lines.append(f"<blockquote><b>{desc}</b></blockquote>")
-    # Звук — ссылка на аудио с CDN
-    music_link = d.get('music_url')
-    zvuk = f"<a href='{music_link}'>Звук</a>" if music_link else "Звук"
-    lines.append(f"{em('music')} <b>{zvuk} • {d['music_dur']}</b>\n")
-
-    # Статистика — числа в <code>
-    s = d['stats']
-    lines.append(f"{em('stats')} <b>Статистика</b>")
-    lines.append(f"• {em('eye')} <b><code>{s['views']:,}</code> Просмотры</b>")
-    lines.append(f"• {em('heart')} <b><code>{s['likes']:,}</code> Лайки</b>")
-    lines.append(f"• {em('comment')} <b><code>{s['comments']:,}</code> Комментарии</b>")
-    lines.append(f"• {em('bookmark')} <b><code>{s['favorites']:,}</code> Избранные</b>")
-    lines.append(f"• {em('repost')} <b><code>{s['shares']:,}</code> Репосты</b>")
-    lines.append(f"• {em('download')} <b><code>{s['downloads']:,}</code> Скачивания</b>\n")
-
-    # Информация — значения в <code>
-    lines.append(f"{em('info')} <b>Информация</b>")
-    lines.append(f"• {em('id')} <b>Айди | <code>{d['video_id']}</code></b>")
-    lines.append(f"• {em('source')} <b>Источник | <a href='{vurl}'><code>Браузер</code></a></b>")
-    lines.append(f"• {em('region')} <b>Регион | <code>{d['region_flag']} {html.escape(d['region_name'])}</code></b>")
-    lines.append(f"• {em('ghost')} <b>Теневой бан | <code>{d['shadow_str']}</code></b>\n")
-
-    # Качество — значения в <code>, показываем оба кодека (hevc + h264)
-    lines.append(f"{em('star')} <b>Качество</b>")
-    lines.append(f"• {em('globe')} <b>Браузер | <code>{top_label}</code></b>")
-    lines.append(f"• {em('phone')} <b>Телефон | <code>{top_label}</code></b>")
-
-    gear = (best or {}).get('gear') or "original"
-    # Ссылки на качества собираем в одну цитату (как раньше)
-    quality_block = []
-    # HEVC: CDN-ссылка (tikwm hdplay) + browser-ссылка (aweme/v1/play из веб-JSON)
-    hevc_cdn = cdn.get('hd_url')
-    aweme = (best or {}).get('aweme_url')
-    if hevc_cdn or aweme:
-        head = f"{em('globe')}{em('phone')} <a href='{hevc_cdn or aweme}'>play_addr</a>"
-        if aweme:
-            head += f"  {em('globe')} <a href='{aweme}'>{gear}</a>"
-        hevc_size = best['size'] if best and best.get('size') else _fmt_size(cdn.get('hd_size'))
-        hevc_br = (best or {}).get('bitrate') or mbps(cdn.get('hd_size'))
-        quality_block.append(f"{head}")
-        quality_block.append(f"{top_label} • {hevc_br or '—'} • hevc • {hevc_size or '—'}")
-    # H264: CDN-ссылка (tikwm play — без водяного знака, h264)
-    h264_cdn = cdn.get('sd_url')
-    if h264_cdn:
-        h264_size = _fmt_size(cdn.get('sd_size'))
-        h264_br = mbps(cdn.get('sd_size'))
-        quality_block.append(f"{em('phone')} <a href='{h264_cdn}'>{gear}</a>")
-        quality_block.append(f"{top_label} • {h264_br or '—'} • h264 • {h264_size or '—'}")
-    if quality_block:
-        lines.append("<blockquote><b>" + "\n".join(quality_block) + "</b></blockquote>")
-
-    lines.append(f"<b>| Оригинал | <code>{d['orig_res']}</code></b>")
-    lines.append(f"<b>| VQ Score | <code>{d['vq_score']}</code></b>\n")
-
-    # Категории — значения в <code>
-    if d['labels']:
-        lines.append(f"{em('folder')} <b>Категории</b>")
-        chunk = d['labels']
-        for i in range(0, len(chunk), 2):
-            part = ", ".join(html.escape(x) for x in chunk[i:i + 2])
-            lines.append(f"<b>| <code>{part}</code></b>")
-        lines.append("")
-
-    # Подпись
-    lines.append(f"{em('bolt')} <b>orbuz:TikTok Checker &amp; Downloader</b>")
-
-    # Кэшируем оригинальный JSON и вешаем кнопку, которая его покажет
-    vid = str(d['video_id'])
-    JSON_CACHE[vid] = d.get('raw') or {}
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📄 JSON (оригинал)", callback_data=f"json:{vid}")
-    ]])
-
-    text = "\n".join(lines)
-    await message.answer(
-        text, parse_mode="HTML",
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=keyboard
-    )
+@dp.callback_query(F.data.startswith("mp3:"))
+async def download_mp3(callback: types.CallbackQuery):
+    vid = callback.data.split(":", 1)[1]
+    d = DATA_CACHE.get(vid)
+    if not d:
+        await callback.answer("Данные устарели, отправьте ссылку заново.", show_alert=True)
+        return
+    if not d.get('music_url'):
+        await callback.answer("Ссылка на звук недоступна.", show_alert=True)
+        return
+    await callback.answer("Скачиваю звук…")
+    data, _ = await asyncio.to_thread(_download_bytes, d['music_url'])
+    if not data:
+        await callback.answer("Не удалось скачать звук.", show_alert=True)
+        return
+    await callback.message.answer_audio(
+        BufferedInputFile(data, filename=f"{d['unique_id']}.mp3"),
+        title=d.get('music_title') or "TikTok audio")
 
 
 @dp.callback_query(F.data.startswith("json:"))
@@ -468,14 +791,10 @@ async def show_json(callback: types.CallbackQuery):
     vid = callback.data.split(":", 1)[1]
     raw = JSON_CACHE.get(vid)
     if not raw:
-        # Кэш мог очиститься (перезапуск бота) — просим прислать ссылку заново
         await callback.answer("JSON больше недоступен, отправьте ссылку заново.", show_alert=True)
         return
-
     pretty = json.dumps(raw, ensure_ascii=False, indent=2)
-    await callback.answer()  # убираем «часики» на кнопке
-
-    # JSON почти всегда длиннее лимита сообщения (4096) — отдаём файлом.
+    await callback.answer()
     file = BufferedInputFile(pretty.encode("utf-8"), filename=f"tiktok_{vid}.json")
     await callback.message.answer_document(
         file, caption=f"Оригинальный JSON • <code>{vid}</code>", parse_mode="HTML"
