@@ -25,6 +25,17 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA, "Referer": "https://www.tiktok.com/"})
 
+# ─────────────────────────────── ПРОКСИ ───────────────────────────────
+# TikTok часто блокирует дата-центровые IP (хостинги). Чтобы обойти — впиши сюда
+# прокси (лучше резидентный/мобильный). Формат:
+#   "http://user:pass@host:port"   или   "http://host:port"
+#   (socks5 тоже можно: "socks5://user:pass@host:port" — нужен пакет requests[socks])
+# Оставь пустым (""), чтобы ходить напрямую.
+PROXY = "http://kQ7AIo0kf4:79mu5s2F9h@23.152.200.36:38194"
+
+if PROXY:
+    SESSION.proxies.update({"http": PROXY, "https": PROXY})
+
 CODEC_MAP = {"h264": "h264", "h265_hvc1": "hevc", "h265": "hevc", "bytevc1": "hevc"}
 
 # ─────────────────────────── PREMIUM ЭМОДЗИ ───────────────────────────
