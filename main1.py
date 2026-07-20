@@ -668,8 +668,8 @@ def build_checker_text(d):
     lines.append(f"• {em('globe')} <b>Браузер | <code>{d.get('browser_label') or top_label}</code></b>")
     lines.append(f"• {em('phone')} <b>Телефон | <code>{top_label}</code></b>")
 
-    # ВСЕ качества, которые видит TikTok (каждый гир отдельной строкой)
-    quality_block = []
+    # ВСЕ качества, которые видит TikTok (каждый гир — отдельным блоком, через пустую строку)
+    quality_entries = []
     for f in d.get('formats', []):
         link = f.get('aweme_url') or (f.get('urls') or [None])[0]
         gear = f.get('gear') or 'video'
@@ -677,18 +677,10 @@ def build_checker_text(d):
             head = f"{em('globe')}{em('phone')} <a href='{link}'>{gear}</a>"
         else:
             head = f"{em('globe')}{em('phone')} {gear}"
-        quality_block.append(head)
-        quality_block.append(
-            f"{f['label']} • {f.get('bitrate') or '—'} • {f['codec']} • {f.get('size') or '—'}")
-    # плюс прямые CDN-ссылки tikwm (без 403), если есть
-    if cdn.get('hd_url'):
-        quality_block.append(f"{em('download')} <a href='{cdn['hd_url']}'>CDN HD (hevc)</a> • "
-                             f"{_fmt_size(cdn.get('hd_size')) or '—'}")
-    if cdn.get('sd_url'):
-        quality_block.append(f"{em('download')} <a href='{cdn['sd_url']}'>CDN SD (h264)</a> • "
-                             f"{_fmt_size(cdn.get('sd_size')) or '—'}")
-    if quality_block:
-        lines.append("<blockquote expandable><b>" + "\n".join(quality_block) + "</b></blockquote>")
+        detail = f"{f['label']} • {f.get('bitrate') or '—'} • {f['codec']} • {f.get('size') or '—'}"
+        quality_entries.append(f"{head}\n{detail}")
+    if quality_entries:
+        lines.append("<blockquote expandable><b>" + "\n\n".join(quality_entries) + "</b></blockquote>")
 
     lines.append(f"<b>| Оригинал | <code>{d['orig_res']}</code></b>")
     lines.append(f"<b>| VQ Score | <code>{d['vq_score']}</code></b>\n")
@@ -721,15 +713,15 @@ def build_hybrid_text(d):
     lines = []
     lines.append(f"{em('video')} <b>ВИДЕО • {d.get('video_dur') or d['music_dur']}</b>\n")
     lines.append(
-        f"{em('user')}<a href='{d['uploader_url']}'>{nick}</a>  "
-        f"{em('calendar')}<a href='{vurl}'>{d['date_short']}</a>  "
-        f"{em('region')}{d['region_flag']} {html.escape(d['region_name'])}")
-    lines.append(f"<blockquote>{desc}</blockquote>")
+        f"{em('user')}<b><a href='{d['uploader_url']}'>{nick}</a></b>  "
+        f"{em('calendar')}<b><a href='{vurl}'>{d['date_short']}</a></b>  "
+        f"{em('region')}<b>{d['region_flag']} {html.escape(d['region_name'])}</b>")
+    lines.append(f"<blockquote><i>{desc}</i></blockquote>")
     lines.append(
-        f"{em('eye')}{humanize(s['views'])} {em('heart')}{humanize(s['likes'])} "
-        f"{em('comment')}{humanize(s['comments'])} {em('bookmark')}{humanize(s['favorites'])} "
-        f"{em('repost')}{humanize(s['shares'])}\n")
-    lines.append("↓ Выберите действие")
+        f"{em('eye')}<b>{humanize(s['views'])}</b> {em('heart')}<b>{humanize(s['likes'])}</b> "
+        f"{em('comment')}<b>{humanize(s['comments'])}</b> {em('bookmark')}<b>{humanize(s['favorites'])}</b> "
+        f"{em('repost')}<b>{humanize(s['shares'])}</b>\n")
+    lines.append("<i>↓ Выберите действие</i>")
 
     # Кнопки: качества для скачивания (по 2 в ряд), Оригинал+MP3, Чекнуть, автор
     rows = []
