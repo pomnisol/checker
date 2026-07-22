@@ -26,20 +26,15 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA, "Referer": "https://www.tiktok.com/"})
 
 # ─────────────────────────────── ПРОКСИ ───────────────────────────────
-# TikTok часто отдаёт капчу вместо video-detail JSON, если IP «засвечен»
-# (в т.ч. домашний после активного парсинга). Прокси это лечит.
-# Формат: "http://user:pass@host:port" или "socks5://user:pass@host:port"
-# (для socks5 нужен пакет requests[socks]). Пусто ("") — ходить напрямую.
+# TikTok часто блокирует дата-центровые IP (хостинги). Чтобы обойти — впиши сюда
+# прокси (лучше резидентный/мобильный). Формат:
+#   "http://user:pass@host:port"   или   "http://host:port"
+#   (socks5 тоже можно: "socks5://user:pass@host:port" — нужен пакет requests[socks])
+# Оставь пустым (""), чтобы ходить напрямую.
 PROXY = "http://kQ7AIo0kf4:79mu5s2F9h@23.152.200.36:38194"
 
 if PROXY:
     SESSION.proxies.update({"http": PROXY, "https": PROXY})
-
-# Пробовать ли мобильный app-API (обогащение списка гиров через подпись X-Gorgon).
-# Сейчас app-API требует ещё и X-Argus (нативный libsscronet.so), которого у нас
-# нет -> запрос отдаёт пустой 200 и только тормозит каждый чек ожиданием. Держим
-# ВЫКЛ; когда появится Argus — поставить True, остальной код уже готов.
-USE_APP_API = False
 
 CODEC_MAP = {"h264": "h264", "h265_hvc1": "hevc", "h265": "hevc", "bytevc1": "hevc"}
 
@@ -126,118 +121,6 @@ def _fetch_web_item(url: str):
     except Exception as e:
         logging.warning(f"fetch_web_item: {e}")
         return None
-
-
-# ───────────────────── МОБИЛЬНЫЙ APP-API (подпись X-Gorgon) ─────────────────────
-# Веб-JSON отдаёт максимум 5 гиров и не содержит «сырых»/HD-гиров и оригинала.
-# Мобильный app-API TikTok богаче (bit_rate с fps/codec/is_bytevc1, чистые
-# tiktokcdn.com-ссылки без 403). Он требует подписи запроса — считаем её на
-# чистом Python через tiktok_signer (X-Gorgon/X-Khronos). Если API недоступен
-# (rate-limit / смена схемы подписи) — тихо возвращаем None и работаем на веб-JSON.
-try:
-    from tiktok_signer import sign as _tt_sign
-except Exception:  # signer недоступен — просто отключаем этот источник
-    _tt_sign = None
-
-# Хосты app-API: пробуем по очереди (часть отвечает пустым 200 при rate-limit).
-_APP_HOSTS = ["api-normal.tiktokv.com", "api16-normal-c-useast1a.tiktokv.com",
-              "api22-normal-c-useast2a.tiktokv.com", "api19-normal-c-useast1a.tiktokv.com"]
-# Версия приложения, при которой app-API отдаёт полный bit_rate и принимает X-Gorgon.
-_APP = {"app_name": "musical_ly", "aid": "1233", "vn": "26.1.3",
-        "vc": "260103", "manifest": "2022601030"}
-_APP_UA = (f"com.zhiliaoapp.musically/{_APP['manifest']} (Linux; U; Android 13; "
-           "en_US; Pixel 7; Build/TD1A.220804.031; Cronet/58.0.2991.0)")
-
-import time as _time, uuid as _uuid, random as _random, string as _string
-from urllib.parse import urlencode as _urlencode
-
-
-def _mstoken(n=107):
-    return "".join(_random.choices(_string.ascii_letters + _string.digits + "-_", k=n))
-
-
-def _app_query(aweme_id):
-    n = int(_time.time())
-    return {
-        "aweme_id": aweme_id, "device_platform": "android", "os": "android", "ssmix": "a",
-        "_rticket": n * 1000, "cdid": str(_uuid.uuid4()), "channel": "googleplay",
-        "aid": _APP["aid"], "app_name": _APP["app_name"], "version_code": _APP["vc"],
-        "version_name": _APP["vn"], "manifest_version_code": _APP["manifest"],
-        "update_version_code": _APP["manifest"], "ab_version": _APP["vn"],
-        "resolution": "1080*2400", "dpi": 420, "device_type": "Pixel 7",
-        "device_brand": "Google", "language": "en", "os_api": "29", "os_version": "13",
-        "ac": "wifi", "is_pad": "0", "current_region": "US", "app_type": "normal",
-        "sys_region": "US", "last_install_time": n - _random.randint(86400, 1123200),
-        "timezone_name": "America/New_York", "residence": "US", "app_language": "en",
-        "timezone_offset": "-14400", "host_abi": "armeabi-v7a", "locale": "en",
-        "ac2": "wifi5g", "uoo": "1", "carrier_region": "US", "op_region": "US",
-        "build_number": _APP["vn"], "region": "US", "ts": n, "msToken": _mstoken(),
-        "device_id": str(_random.randint(7250000000000000000, 7351147085025500000)),
-        "openudid": "".join(_random.choices("0123456789abcdef", k=16)),
-    }
-
-
-def _fetch_app_item(aweme_id: str):
-    """Подписанный запрос к app-API. Возвращает aweme_detail (dict) или None."""
-    if not _tt_sign or not aweme_id or aweme_id == "N/A":
-        return None
-    for host in _APP_HOSTS:
-        try:
-            url = f"https://{host}/aweme/v1/aweme/detail/?" + _urlencode(_app_query(aweme_id))
-            cookie = "odin_tt=" + "".join(_random.choices("0123456789abcdef", k=160))
-            headers = _tt_sign(url, body=None, cookie=cookie)
-            headers.update({"User-Agent": _APP_UA, "Accept": "application/json",
-                            "Cookie": cookie})
-            r = SESSION.get(url, headers=headers, timeout=15)
-            if r.status_code != 200 or len(r.content) < 50:
-                continue  # пустой 200 = rate-limit этого хоста, пробуем следующий
-            j = r.json()
-            aw = j.get("aweme_detail") or (j.get("aweme_list") or [None])[0]
-            if aw and aw.get("video"):
-                return aw
-        except Exception as e:
-            logging.warning(f"fetch_app_item {host}: {e}")
-    return None
-
-
-def _app_formats(aweme):
-    """Разбирает bit_rate из app-API в тот же формат, что и веб-гиры.
-    Возвращает (formats_list, best, orig_gear) или ([], None, None)."""
-    video = (aweme or {}).get("video", {}) or {}
-    bit_rate = video.get("bit_rate") or []
-    if not bit_rate:
-        return [], None, None
-    formats, best, orig_gear = [], None, None
-    for b in bit_rate:
-        pa = b.get("play_addr", {}) or {}
-        w, h = pa.get("width"), pa.get("height")
-        fps = b.get("fps")
-        br = b.get("bit_rate")
-        codec = "hevc" if b.get("is_bytevc1") else "h264"
-        short = min(w, h) if (w and h) else (w or h or 0)
-        res_class = {2160: "4K", 1440: "2K", 1080: "1080p", 720: "720p", 576: "576p",
-                     540: "540p", 480: "480p", 360: "360p", 240: "240p"}.get(
-                         short, f"{short}p" if short else "")
-        gear_label = f"{res_class}{fps}" if fps else res_class
-        urls = list(pa.get("url_list", []) or [])
-        fmt = {
-            "gear": b.get("gear_name"), "label": gear_label,
-            "resolution": f"{w}x{h}" if w and h else "N/A", "res_class": res_class,
-            "height_num": h or 0, "fps": fps, "area": (w or 0) * (h or 0),
-            "bitrate": f"{br / 1_000_000:.1f} Mbps" if br else None,
-            "codec": codec, "size": _fmt_size(pa.get("data_size")),
-            "size_bytes": pa.get("data_size"),
-            # у app-API ссылки уже прямые (tiktokcdn.com), берём первую как основную
-            "aweme_url": next((u for u in urls if "aweme/v1/play" in u), urls[0] if urls else None),
-            "urls": urls,
-        }
-        formats.append(fmt)
-        if best is None or fmt["height_num"] > best["height_num"]:
-            best = fmt
-        if orig_gear is None or fmt["area"] > orig_gear["area"]:
-            orig_gear = fmt
-    formats.sort(key=lambda x: x["height_num"], reverse=True)
-    return formats, best, orig_gear
 
 
 def _fetch_open_cdn(url: str):
@@ -481,14 +364,14 @@ def extract_tiktok_full_analytics(url: str):
     shadow = (not item.get("indexEnabled", True)) or item.get("isReviewing") or item.get("privateItem")
     shadow_str = "Да" if shadow else "Нет"
 
-    # VQScore (оригинальное разрешение считаем ниже — по максимальному гиру,
-    # т.к. video.width/height часто = размер дефолтного web-стрима, а не оригинала)
+    # Оригинальное разрешение и VQScore
+    orig_w, orig_h = video.get("width"), video.get("height")
+    orig_res = f"{orig_w}x{orig_h}" if orig_w and orig_h else "N/A"
     vq_score = video.get("VQScore") or "0"
 
     # Качества с настоящим FPS (BitrateFPS)
     formats_data = []
-    best = None          # максимум по высоте кадра (для "лучшее качество")
-    orig_gear = None     # настоящий оригинал — максимум по площади (WxH)
+    best = None
     for b in video.get("bitrateInfo", []) or []:
         pa = b.get("PlayAddr", {}) or {}
         w, h = pa.get("Width"), pa.get("Height")
@@ -499,9 +382,8 @@ def extract_tiktok_full_analytics(url: str):
         # Ярлык качества а-ля "4K120": класс разрешения (по короткой стороне) + fps.
         # У TikTok видео вертикальное, поэтому "качество" определяет меньшая сторона.
         short = min(w, h) if (w and h) else (w or h or 0)
-        res_class = {2160: "4K", 1440: "2K", 1080: "1080p", 720: "720p", 576: "576p",
-                     540: "540p", 480: "480p", 360: "360p", 240: "240p"}.get(
-                         short, f"{short}p" if short else "")
+        res_class = {2160: "4K", 1440: "2K", 1080: "1080p", 720: "720p",
+                     540: "540p", 480: "480p", 360: "360p"}.get(short, str(short or ""))
         gear_label = f"{res_class}{fps}" if fps else res_class
         # openable-ссылка на этот гир: aweme/v1/play (открывается без 403)
         aweme_url = next((u for u in pa.get("UrlList", []) if "aweme/v1/play" in u), None)
@@ -510,7 +392,6 @@ def extract_tiktok_full_analytics(url: str):
             'resolution': f"{w}x{h}" if w and h else "N/A",
             'res_class': res_class,
             'height_num': h or 0, 'fps': fps,
-            'area': (w or 0) * (h or 0),
             'bitrate': f"{br / 1_000_000:.1f} Mbps" if br else None,
             'codec': codec, 'size': _fmt_size(pa.get("DataSize")),
             'size_bytes': pa.get("DataSize"),
@@ -520,41 +401,7 @@ def extract_tiktok_full_analytics(url: str):
         formats_data.append(fmt)
         if best is None or fmt['height_num'] > best['height_num']:
             best = fmt
-        if orig_gear is None or fmt['area'] > orig_gear['area']:
-            orig_gear = fmt
     formats_data.sort(key=lambda x: x['height_num'], reverse=True)
-
-    # Обогащение из мобильного app-API (подпись X-Gorgon): он отдаёт больше гиров
-    # и чистые tiktokcdn.com-ссылки. Включается флагом USE_APP_API (см. верх файла).
-    if USE_APP_API:
-        app_aweme = _fetch_app_item(str(video_id))
-        app_formats, app_best, app_orig = _app_formats(app_aweme)
-        if app_formats:
-            formats_data = app_formats
-            best = app_best or best
-            orig_gear = app_orig or orig_gear
-
-    # Настоящее оригинальное разрешение: максимум среди гиров (video.width/height
-    # часто = 576 из-за дефолтного web-playAddr), запас — размеры из video.
-    if orig_gear and orig_gear.get('resolution') != "N/A":
-        orig_res = orig_gear['resolution']
-    else:
-        orig_w, orig_h = video.get("width"), video.get("height")
-        orig_res = f"{orig_w}x{orig_h}" if orig_w and orig_h else "N/A"
-
-    # Качество для строки «Браузер»: дефолтный веб-стрим (h264 / normal_*),
-    # для «Телефон» — максимальное (best). У примера: Браузер 576p30, Телефон 1080p59.
-    browser_fmt = next((f for f in formats_data
-                        if f['codec'] == 'h264' or 'normal' in (f.get('gear') or '')), None)
-    browser_label = (browser_fmt or best or {}).get('label', "—")
-
-    # Длительность видео в формате M:SS (именно видео, НЕ звука)
-    _vd = video.get('duration')
-    try:
-        _vd = int(_vd)
-        video_dur = f"{_vd // 60}:{_vd % 60:02d}"
-    except (TypeError, ValueError):
-        video_dur = "0:00"
 
     cdn = _fetch_open_cdn(final_url)
     # Ссылка на звук: приоритет CDN-us (tikwm), запас — playUrl из веб-JSON
@@ -577,12 +424,11 @@ def extract_tiktok_full_analytics(url: str):
         'date_str': date_str, 'date_short': date_short,
         'final_url': final_url, 'video_url': video_url, 'description': description,
         'music_title': music_title, 'music_dur': music_dur, 'music_url': music_url,
-        'duration': video.get('duration'), 'video_dur': video_dur, 'cover': cover,
+        'duration': video.get('duration'), 'cover': cover,
         'stats': stats, 'video_id': video_id,
         'region_code': region_code, 'region_name': region_name, 'region_flag': _flag(region_code),
         'shadow_str': shadow_str, 'orig_res': orig_res, 'vq_score': vq_score,
-        'formats': formats_data, 'best': best, 'orig_gear': orig_gear,
-        'browser_label': browser_label, 'cdn': cdn, 'labels': labels,
+        'formats': formats_data, 'best': best, 'cdn': cdn, 'labels': labels,
         'raw': item,  # оригинальный JSON (itemStruct) для кнопки "JSON"
     }
 
@@ -665,11 +511,11 @@ def build_checker_text(d):
     lines.append(f"• {em('ghost')} <b>Теневой бан | <code>{d['shadow_str']}</code></b>\n")
 
     lines.append(f"{em('star')} <b>Качество</b>")
-    lines.append(f"• {em('globe')} <b>Браузер | <code>{d.get('browser_label') or top_label}</code></b>")
+    lines.append(f"• {em('globe')} <b>Браузер | <code>{top_label}</code></b>")
     lines.append(f"• {em('phone')} <b>Телефон | <code>{top_label}</code></b>")
 
-    # ВСЕ качества, которые видит TikTok (каждый гир — отдельным блоком, через пустую строку)
-    quality_entries = []
+    # ВСЕ качества, которые видит TikTok (каждый гир отдельной строкой)
+    quality_block = []
     for f in d.get('formats', []):
         link = f.get('aweme_url') or (f.get('urls') or [None])[0]
         gear = f.get('gear') or 'video'
@@ -677,10 +523,18 @@ def build_checker_text(d):
             head = f"{em('globe')}{em('phone')} <a href='{link}'>{gear}</a>"
         else:
             head = f"{em('globe')}{em('phone')} {gear}"
-        detail = f"{f['label']} • {f.get('bitrate') or '—'} • {f['codec']} • {f.get('size') or '—'}"
-        quality_entries.append(f"{head}\n{detail}")
-    if quality_entries:
-        lines.append("<blockquote expandable><b>" + "\n\n".join(quality_entries) + "</b></blockquote>")
+        quality_block.append(head)
+        quality_block.append(
+            f"{f['label']} • {f.get('bitrate') or '—'} • {f['codec']} • {f.get('size') or '—'}")
+    # плюс прямые CDN-ссылки tikwm (без 403), если есть
+    if cdn.get('hd_url'):
+        quality_block.append(f"{em('download')} <a href='{cdn['hd_url']}'>CDN HD (hevc)</a> • "
+                             f"{_fmt_size(cdn.get('hd_size')) or '—'}")
+    if cdn.get('sd_url'):
+        quality_block.append(f"{em('download')} <a href='{cdn['sd_url']}'>CDN SD (h264)</a> • "
+                             f"{_fmt_size(cdn.get('sd_size')) or '—'}")
+    if quality_block:
+        lines.append("<blockquote expandable><b>" + "\n".join(quality_block) + "</b></blockquote>")
 
     lines.append(f"<b>| Оригинал | <code>{d['orig_res']}</code></b>")
     lines.append(f"<b>| VQ Score | <code>{d['vq_score']}</code></b>\n")
@@ -711,17 +565,17 @@ def build_hybrid_text(d):
     s = d['stats']
 
     lines = []
-    lines.append(f"{em('video')} <b>ВИДЕО • {d.get('video_dur') or d['music_dur']}</b>\n")
+    lines.append(f"{em('video')} <b>ВИДЕО • {d['music_dur']}</b>\n")
     lines.append(
-        f"{em('user')}<b><a href='{d['uploader_url']}'>{nick}</a></b>  "
-        f"{em('calendar')}<b><a href='{vurl}'>{d['date_short']}</a></b>  "
-        f"{em('region')}<b>{d['region_flag']} {html.escape(d['region_name'])}</b>")
-    lines.append(f"<blockquote><i>{desc}</i></blockquote>")
+        f"{em('user')}<a href='{d['uploader_url']}'>{nick}</a>  "
+        f"{em('calendar')}<a href='{vurl}'>{d['date_short']}</a>  "
+        f"{em('region')}{d['region_flag']} {html.escape(d['region_name'])}")
+    lines.append(f"<blockquote>{desc}</blockquote>")
     lines.append(
-        f"{em('eye')}<b>{humanize(s['views'])}</b> {em('heart')}<b>{humanize(s['likes'])}</b> "
-        f"{em('comment')}<b>{humanize(s['comments'])}</b> {em('bookmark')}<b>{humanize(s['favorites'])}</b> "
-        f"{em('repost')}<b>{humanize(s['shares'])}</b>\n")
-    lines.append("<i>↓ Выберите действие</i>")
+        f"{em('eye')}{humanize(s['views'])} {em('heart')}{humanize(s['likes'])} "
+        f"{em('comment')}{humanize(s['comments'])} {em('bookmark')}{humanize(s['favorites'])} "
+        f"{em('repost')}{humanize(s['shares'])}\n")
+    lines.append("↓ Выберите действие")
 
     # Кнопки: качества для скачивания (по 2 в ряд), Оригинал+MP3, Чекнуть, автор
     rows = []
@@ -899,13 +753,10 @@ async def download_original(callback: types.CallbackQuery):
         return
     await callback.answer("Скачиваю оригинал…")
     cdn = d.get('cdn') or {}
-    # «Оригинал» = гир с максимальной площадью кадра (orig_gear), запас — best.
-    orig = d.get('orig_gear') or d.get('best') or {}
-    urls = []
-    if orig.get('aweme_url'):
-        urls.append(orig['aweme_url'])
-    urls += (orig.get('urls') or [])
-    urls += [cdn.get('hd_url'), cdn.get('sd_url')]
+    best = d.get('best') or {}
+    urls = [cdn.get('hd_url'), cdn.get('sd_url')] + (best.get('urls') or [])
+    if best.get('aweme_url'):
+        urls.insert(0, best['aweme_url'])
     data, _ = await asyncio.to_thread(_download_bytes, urls)
     if not data:
         await callback.answer("Не удалось скачать оригинал.", show_alert=True)
